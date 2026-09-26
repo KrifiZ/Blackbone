@@ -194,7 +194,10 @@ NTSTATUS RemoteExec::ExecInAnyThread( PVOID pCode, size_t size, uint64_t& callRe
         ResetEvent( _hWaitEvent );
 
     if (!thd->Suspend())
+    {
+        BLACKBONE_TRACE( L"RemoteExec: Suspend failed, status 0x%08x, win32 error %u", LastNtStatus(), GetLastError() );
         return LastNtStatus();
+    }
 
     auto a = AsmFactory::GetAssembler( _process.core().isWow64() );
     if (!_process.core().isWow64())
@@ -209,8 +212,21 @@ NTSTATUS RemoteExec::ExecInAnyThread( PVOID pCode, size_t size, uint64_t& callRe
 
         if (!NT_SUCCESS( status = thd->GetContext( ctx64, CONTEXT64_CONTROL, true ) ))
         {
-            thd->Resume();
-            return status;
+            // SuspendThread returns before the thread has actually stopped - the kernel
+            // suspends it at the next safe point - and GetThreadContext on a thread that
+            // has not settled yet reports STATUS_PENDING. The context becomes readable as
+            // soon as the thread stops, so retry briefly instead of failing the whole map.
+            for (int attempt = 0; status == STATUS_PENDING && attempt < 10; ++attempt)
+            {
+                Sleep( 50 );
+                status = thd->GetContext( ctx64, CONTEXT64_CONTROL, true );
+            }
+            if (!NT_SUCCESS( status ))
+            {
+                BLACKBONE_TRACE( L"RemoteExec: GetContext failed, status 0x%08x, win32 error %u", status, GetLastError() );
+                thd->Resume();
+                return status;
+            }
         }
 
         //
@@ -299,8 +315,18 @@ NTSTATUS RemoteExec::ExecInAnyThread( PVOID pCode, size_t size, uint64_t& callRe
     {
         if (!NT_SUCCESS( status = thd->GetContext( ctx32, CONTEXT_CONTROL, true ) ))
         {
-            thd->Resume();
-            return status;
+            // Same STATUS_PENDING transient as in the x64 path above.
+            for (int attempt = 0; status == STATUS_PENDING && attempt < 10; ++attempt)
+            {
+                Sleep( 50 );
+                status = thd->GetContext( ctx32, CONTEXT_CONTROL, true );
+            }
+            if (!NT_SUCCESS( status ))
+            {
+                BLACKBONE_TRACE( L"RemoteExec: GetContext failed, status 0x%08x, win32 error %u", status, GetLastError() );
+                thd->Resume();
+                return status;
+            }
         }
 
         (*a)->pusha();
@@ -329,17 +355,33 @@ NTSTATUS RemoteExec::ExecInAnyThread( PVOID pCode, size_t size, uint64_t& callRe
             ctx64.Rip = _userCode[_currentBufferIdx].ptr() + size;
             status = thd->SetContext( ctx64, true );
         }
+
+        // SetThreadContext can report the same transient STATUS_PENDING as GetThreadContext.
+        for (int attempt = 0; status == STATUS_PENDING && attempt < 10; ++attempt)
+        {
+            Sleep( 50 );
+            if (_process.core().isWow64())
+                status = thd->SetContext( ctx32, true );
+            else
+                status = thd->SetContext( ctx64, true );
+        }
+        if (!NT_SUCCESS( status ))
+            BLACKBONE_TRACE( L"RemoteExec: SetContext failed, status 0x%08x, win32 error %u", status, GetLastError() );
     }
 
     thd->Resume();
     if (NT_SUCCESS( status ))
     {
-        // DllMain finishes in well under a second in practice; the timeout is a safety
-        // net, not a deadline. On timeout the result slot below is still read, so a slow
-        // DllMain just completes late (the module finishes initialising on its own)
-        // instead of failing the whole map.
-        if (WaitForSingleObject( _hWaitEvent, 20 * 1000 ) == WAIT_TIMEOUT)
-            BLACKBONE_TRACE( L"RemoteExec: DllMain still running after 20 s, continuing" );
+        // The remote call (DllMain included) finishes in well under a second in practice;
+        // the 30 s cap is a safety net, not a deadline (same cap as the worker path).
+        // On timeout we give the call a grace period before reading the result slot and
+        // moving on: the remote thread may still be running our stub, and re-hijacking
+        // the same thread immediately would interrupt it mid-flight.
+        if (WaitForSingleObject( _hWaitEvent, 30 * 1000 ) == WAIT_TIMEOUT)
+        {
+            BLACKBONE_TRACE( L"RemoteExec: remote call still running after 30 s, grace period up to 60 s" );
+            WaitForSingleObject( _hWaitEvent, 30 * 1000 );
+        }
         status = _userData[_currentBufferIdx].Read( INTRET_OFFSET, callResult );
     }
 

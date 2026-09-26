@@ -243,7 +243,14 @@ NTSTATUS Native::CreateRemoteThreadT( HANDLE& hThread, ptr_t entry, ptr_t arg, C
 NTSTATUS Native::GetThreadContextT( HANDLE hThread, _CONTEXT64& ctx )
 {
     auto r = GetThreadContext(hThread, reinterpret_cast<PCONTEXT>(&ctx));
-    return r != 0 ? STATUS_SUCCESS : LastNtStatus();
+    if (r != 0)
+        return STATUS_SUCCESS;
+
+    // LastStatusValue holds the real NtGetContextThread status here (the kernel stores it
+    // on every syscall return). STATUS_PENDING means the thread is not fully suspended
+    // yet and its context is not readable - the caller is expected to retry after a delay.
+    BLACKBONE_TRACE( L"Native: GetThreadContext failed, status 0x%08x, win32 error %u", LastNtStatus(), GetLastError() );
+    return LastNtStatus();
 }
 
 /// <summary>
@@ -275,7 +282,12 @@ NTSTATUS Native::GetThreadContextT( HANDLE hThread, _CONTEXT32& ctx )
 NTSTATUS Native::SetThreadContextT( HANDLE hThread, _CONTEXT64& ctx )
 {
     auto r = SetThreadContext(hThread, reinterpret_cast<PCONTEXT>(&ctx));
-    return r != 0 ? STATUS_SUCCESS : LastNtStatus();
+    if (r != 0)
+        return STATUS_SUCCESS;
+
+    // See GetThreadContextT above - STATUS_PENDING is the transient "not suspended yet".
+    BLACKBONE_TRACE( L"Native: SetThreadContext failed, status 0x%08x, win32 error %u", LastNtStatus(), GetLastError() );
+    return LastNtStatus();
 }
 
 /// <summary>
