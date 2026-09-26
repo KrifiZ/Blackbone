@@ -1,6 +1,7 @@
 #include "RemoteExec.h"
 #include "../Process.h"
 #include "../../Misc/DynImport.h"
+#include "../../Misc/Trace.hpp"
 #include "../../Symbols/SymbolData.h"
 
 #include <3rd_party/VersionApi.h>
@@ -215,14 +216,55 @@ NTSTATUS RemoteExec::ExecInAnyThread( PVOID pCode, size_t size, uint64_t& callRe
         //
         // Preserve thread context
         // I don't care about FPU, XMM and anything else
-        // Stack must be aligned on 16 bytes 
+        // Stack must be aligned on 16 bytes
         //
-        (*a)->sub( asmjit::host::rsp, count * sizeof( uint64_t ) );
-        (*a)->pushf(); 
+        // Save area layout (0xC0 = 192 bytes, a multiple of 16, so rsp stays aligned the
+        // same way at the GenCall below as before this change):
+        //   [rsp+0x00..0x77]  15 general registers
+        //   [rsp+0x78..0xA7]  debug registers dr0..dr3, dr6, dr7 (dr4/dr5 are aliases)
+        //   [rsp+0xA8]        captured EFlags (TF included)
+        //
+        // The engine's anti-tamper code sets TF and hardware breakpoints on worker threads,
+        // and the hijacked thread can carry that state into the stub. TF is cleared for the
+        // duration of DllMain (a single-step trap inside the codecave would hit the game's
+        // VEH with the instruction pointer in our private memory), and the debug registers
+        // are saved and cleared (dr7 = 0 disarms every trap, so no DR hit can fire while
+        // the module runs). Everything is restored verbatim at the end.
+        constexpr uint32_t kDrArea    = 0x78;
+        constexpr uint32_t kFlagsSlot = 0xA8;
+        static const uint32_t drs[] = { 0, 1, 2, 3, 6, 7 };
 
-        // Save registers
+        (*a)->sub( asmjit::host::rsp, 0xC0 );
+
+        // Save registers (first, so the EFlags dance below can reuse rcx)
         for (int i = 0; i < count; i++)
             (*a)->mov( asmjit::Mem( asmjit::host::rsp, i * sizeof( uint64_t ) ), regs[i] );
+
+        // Capture EFlags: the original value goes to the save slot, and TF is cleared in
+        // the live flag register for the whole call.
+        (*a)->pushf();
+        (*a)->pop( asmjit::host::rcx );
+        (*a)->mov( asmjit::Mem( asmjit::host::rsp, kFlagsSlot ), asmjit::host::rcx );
+        (*a)->and_( asmjit::host::rcx, static_cast<uint32_t>( ~0x100 ) );   // TF = bit 8
+        (*a)->push( asmjit::host::rcx );
+        (*a)->popf();
+
+        // Save debug registers - raw bytes, this asmjit build has no DrReg operands:
+        //   mov [rsp+disp32], drN  = 0F 73 (04|N<<3) <disp32>
+        for (int i = 0; i < 6; i++)
+        {
+            (*a)->db( 0x73 );
+            (*a)->db( static_cast<uint8_t>( 0x04 | ( drs[i] << 3 ) ) );
+            (*a)->dd( kDrArea + i * sizeof( uint64_t ) );
+        }
+
+        // Clear them: no trap can fire while DllMain runs
+        (*a)->xor_( asmjit::host::rax, asmjit::host::rax );
+        for (int i = 0; i < 6; i++)
+        {
+            (*a)->db( 0x73 );
+            (*a)->db( static_cast<uint8_t>( 0xC0 | ( drs[i] << 3 ) ) );
+        }
 
         a->GenCall( _userCode[_currentBufferIdx].ptr(), { _userData[_currentBufferIdx].ptr() } );
         AddReturnWithEvent( *a, mt_mod64, rt_int32, INTRET_OFFSET );
@@ -231,8 +273,22 @@ NTSTATUS RemoteExec::ExecInAnyThread( PVOID pCode, size_t size, uint64_t& callRe
         for (int i = 0; i < count; i++)
             (*a)->mov( regs[i], asmjit::Mem( asmjit::host::rsp, i * sizeof( uint64_t ) ) );
 
+        // Restore debug registers:
+        //   mov drN, [rsp+disp32]  = 0F 72 (04|N<<3) <disp32>
+        for (int i = 0; i < 6; i++)
+        {
+            (*a)->db( 0x72 );
+            (*a)->db( static_cast<uint8_t>( 0x04 | ( drs[i] << 3 ) ) );
+            (*a)->dd( kDrArea + i * sizeof( uint64_t ) );
+        }
+
+        // Restore the captured EFlags verbatim (pushed straight from memory, so the
+        // just-restored rcx survives). If TF was set when the thread was suspended, the
+        // re-armed step lands on the original first instruction after the jmp below -
+        // a plain trap the module handles, not a fatal one.
+        (*a)->push( asmjit::Mem( asmjit::host::rsp, kFlagsSlot ) );
         (*a)->popf();
-        (*a)->add( asmjit::host::rsp, count * sizeof( uint64_t ) );
+        (*a)->add( asmjit::host::rsp, 0xC0 );
 
         // jmp [rip]
         (*a)->dw( '\xFF\x25' );
@@ -278,7 +334,12 @@ NTSTATUS RemoteExec::ExecInAnyThread( PVOID pCode, size_t size, uint64_t& callRe
     thd->Resume();
     if (NT_SUCCESS( status ))
     {
-        WaitForSingleObject( _hWaitEvent, 20 * 1000/*INFINITE*/ );
+        // DllMain finishes in well under a second in practice; the timeout is a safety
+        // net, not a deadline. On timeout the result slot below is still read, so a slow
+        // DllMain just completes late (the module finishes initialising on its own)
+        // instead of failing the whole map.
+        if (WaitForSingleObject( _hWaitEvent, 20 * 1000 ) == WAIT_TIMEOUT)
+            BLACKBONE_TRACE( L"RemoteExec: DllMain still running after 20 s, continuing" );
         status = _userData[_currentBufferIdx].Read( INTRET_OFFSET, callResult );
     }
 
@@ -362,7 +423,11 @@ NTSTATUS RemoteExec::CreateRPCEnvironment( WorkerThreadMode mode /*= Worker_None
     // Get thread to hijack
     else if (mode == Worker_UseExisting)
     {
-        _hijackThread = _process.threads().getMostExecuted();
+        // A caller may have pinned a specific thread first (setHijackThread), e.g. one that
+        // is actually executing code instead of parked in a syscall; fall back to the
+        // most-executed thread otherwise.
+        if (!_hijackThread)
+            _hijackThread = _process.threads().getMostExecuted();
         if (!_hijackThread)
             return STATUS_INVALID_THREAD;
 

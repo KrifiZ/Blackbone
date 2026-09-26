@@ -176,6 +176,13 @@ public:
     BLACKBONE_API ThreadPtr getExecThread() { return _hijackThread ? _hijackThread : _workerThread; }
 
     /// <summary>
+    /// Pin the existing thread that will be hijacked for RPC execution.
+    /// If not set, CreateRPCEnvironment falls back to the most-executed thread.
+    /// </summary>
+    /// <param name="thread">The thread to hijack</param>
+    BLACKBONE_API void setHijackThread( const ThreadPtr& thread ) { _hijackThread = thread; }
+
+    /// <summary>
     /// Ge memory routines
     /// </summary>
     /// <returns></returns>
